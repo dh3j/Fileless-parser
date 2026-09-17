@@ -3,9 +3,9 @@
 .SYNOPSIS
   Read-only Windows execution-telemetry triage for PowerShell and CMD.
 .DESCRIPTION
-  Reads existing event logs and Prefetch metadata only. It does not delete logs,
-  alter policy, stop processes, or otherwise modify the system. Triage labels are
-  heuristics: "legit" does not mean safe; "suspicious" is not proof of malware.
+  Reads existing logs and Prefetch metadata only. It does not modify the machine.
+  "Legit" means no configured heuristic matched; it is not a safety guarantee.
+  "Suspicious" is a triage signal, not proof of malware.
 #>
 [CmdletBinding()]
 param()
@@ -13,12 +13,10 @@ param()
 $ErrorActionPreference='SilentlyContinue'
 try{$Host.UI.RawUI.WindowTitle='FILELESS PARSER'}catch{}
 $AnsiOrange="$([char]27)[38;2;251;84;43m"; $AnsiReset="$([char]27)[0m"
-$script:BootTime=$null
-try{$script:BootTime=(Get-CimInstance -ClassName Win32_OperatingSystem).LastBootUpTime}catch{}
+try{$script:BootTime=(Get-CimInstance -ClassName Win32_OperatingSystem).LastBootUpTime}catch{$script:BootTime=$null}
 
 function C { param([string]$Text,[string]$Color='White',[switch]$NoNewline)
-  if($Color -eq 'Orange'){Write-Host ($AnsiOrange+$Text+$AnsiReset) -NoNewline:$NoNewline}
-  else{Write-Host $Text -ForegroundColor $Color -NoNewline:$NoNewline}
+  if($Color -eq 'Orange'){Write-Host ($AnsiOrange+$Text+$AnsiReset) -NoNewline:$NoNewline}else{Write-Host $Text -ForegroundColor $Color -NoNewline:$NoNewline}
 }
 function Header {
   Clear-Host
@@ -34,98 +32,83 @@ function Header {
 }
 function Ask-InstanceOnly {
   C "`nDo you want to scan instance-only ones? (y/n): " 'Orange' -NoNewline
-  $answer=(Read-Host).Trim().ToLowerInvariant()
-  $since=$null
-  if($answer -in @('y','yes')){
-    $since=$script:BootTime
-    if($since){C ("Filtering to events since last Windows boot: {0}" -f $since.ToString('yyyy-MM-dd HH:mm:ss')) 'Orange'}
-    else{C 'Could not determine last boot time; scanning all retained events.' 'Yellow'}
-  }
+  $answer=(Read-Host).Trim().ToLowerInvariant(); $since=$null
+  if($answer -in @('y','yes')){$since=$script:BootTime;if($since){C ("Filtering to activity since last Windows boot: {0}" -f $since.ToString('yyyy-MM-dd HH:mm:ss')) 'Orange'}else{C 'Boot time unavailable; scanning all retained records.' 'Yellow'}}
   return $since
 }
-function Get-EventsSafe { param([string]$LogName,[int[]]$Ids,[int]$MaxEvents=2000,[datetime]$Since)
-  try {
-    $filter=@{LogName=$LogName;Id=$Ids}
-    if($Since){$filter.StartTime=$Since}
-    return @(Get-WinEvent -FilterHashtable $filter -MaxEvents $MaxEvents)
-  } catch{return @()}
+function Get-EventsSafe { param([string]$LogName,[int[]]$Ids,[int]$MaxEvents=3000,[datetime]$Since)
+  try{$filter=@{LogName=$LogName;Id=$Ids};if($Since){$filter.StartTime=$Since};@(Get-WinEvent -FilterHashtable $filter -MaxEvents $MaxEvents)}catch{@()}
 }
 function Get-EventDataValue { param([object]$Event,[string]$Name)
-  try{[xml]$xml=$Event.ToXml(); foreach($node in $xml.Event.EventData.Data){if($node.Name -eq $Name){return [string]$node.'#text'}}}catch{}
-  return $null
+  try{[xml]$xml=$Event.ToXml();foreach($node in $xml.Event.EventData.Data){if($node.Name -eq $Name){return [string]$node.'#text'}}}catch{};return $null
 }
-function Shorten-Text { param([string]$Text,[int]$Length=150)
-  $Text=($Text -replace '\s+',' ').Trim()
-  if([string]::IsNullOrWhiteSpace($Text)){return '[No command line or script content recorded]'}
-  if($Text.Length -gt $Length){return $Text.Substring(0,$Length)+'...'}
-  return $Text
+function Shorten-Text { param([string]$Text,[int]$Length=140)
+  $Text=($Text -replace '\s+',' ').Trim();if([string]::IsNullOrWhiteSpace($Text)){return '[No command line recorded]'};if($Text.Length -gt $Length){return $Text.Substring(0,$Length)+'...'};return $Text
 }
-function Test-SuspiciousText { param([string]$Text)
-  if([string]::IsNullOrWhiteSpace($Text)){return $false}
-  $patterns=@(
-    '(?i)\b(?:powershell|pwsh)(?:\.exe)?\b.*(?:-enc|-encodedcommand|\s-e\s)',
-    '(?i)\b(?:iex|invoke-expression)\b','(?i)(?:frombase64string|downloadstring|downloadfile|webclient|invoke-webrequest|\biwr\b|start-bitstransfer)',
-    '(?i)(?:amsiutils|amsiinitfailed|set-mppreference)','(?i)(?:reflection\.assembly|add-type|virtualalloc|createthread|marshal\]::copy)',
-    '(?i)\b(?:mshta|rundll32|regsvr32|certutil|bitsadmin|wmic|cscript|wscript|installutil)\b',
-    '(?i)\b(?:cmd|cmd\.exe)\b.*(?:/c|/r)','(?i)(?:wevtutil\s+(?:cl|clear-log)|clear-eventlog|remove-eventlog)',
-    '(?i)(?:-windowstyle\s+hidden|\bhidden\b|\bbypass\b|\bnop\b)'
-  )
-  foreach($pattern in $patterns){if($Text -match $pattern){return $true}}; return $false
+function Get-ProgramName { param([string]$Image,[string]$Command)
+  if($Image){return [IO.Path]::GetFileName($Image)}
+  if($Command -match '^\s*"?([^"\s]+(?:\.exe|\.com|\.bat|\.cmd|\.ps1)?)'){return [IO.Path]::GetFileName($Matches[1])}
+  return 'Unknown process'
 }
-function Show-Result { param([datetime]$Time,[string]$Source,[string]$Command,[string]$Extra='')
-  $label=if(Test-SuspiciousText $Command){'suspicious'}else{'legit'}
-  $suffix=if($Extra){" | $Extra"}else{''}
-  $line='[{0}] [{1}] {2}{3} | {4}' -f $Time.ToString('yyyy-MM-dd HH:mm:ss'),$Source,(Shorten-Text $Command 150),$suffix,$label
-  if($label -eq 'suspicious'){C $line 'Red'}else{C $line 'Green'}
+function Test-WindowsSystemProcess { param([string]$Image)
+  if([string]::IsNullOrWhiteSpace($Image)){return $false}
+  $systemRoot=[regex]::Escape($env:WINDIR)
+  return ($Image -match "(?i)^$systemRoot\\(?:System32|SysWOW64|SystemApps|WinSxS)\\")
+}
+function Get-Triage { param([string]$Command,[string]$Image)
+  $text="$Image $Command"
+  if([string]::IsNullOrWhiteSpace($text)){return @{Label='Legit';Reason='No command line was recorded.'}}
+  if($text -match '(?i)\b(?:wevtutil\s+(?:cl|clear-log)|clear-eventlog|remove-eventlog)'){return @{Label='Suspicious';Reason='Event-log clearing command detected.'}}
+  if($text -match '(?i)\b(?:powershell|pwsh)(?:\.exe)?\b.*(?:-enc|-encodedcommand|\s-e\s)'){return @{Label='Suspicious';Reason='Encoded PowerShell command detected.'}}
+  if($text -match '(?i)\b(?:iex|invoke-expression)\b'){return @{Label='Suspicious';Reason='PowerShell dynamic code execution detected.'}}
+  if($text -match '(?i)(?:frombase64string|downloadstring|downloadfile|webclient|invoke-webrequest|\biwr\b|start-bitstransfer)'){return @{Label='Suspicious';Reason='Download, decoding, or remote-content execution behavior detected.'}}
+  if($text -match '(?i)(?:amsiutils|amsiinitfailed|set-mppreference)'){return @{Label='Suspicious';Reason='Security-control or AMSI-related behavior detected.'}}
+  if($text -match '(?i)(?:reflection\.assembly|add-type|virtualalloc|createthread|marshal\]::copy)'){return @{Label='Suspicious';Reason='In-memory code-loading behavior detected.'}}
+  if($text -match '(?i)\b(?:mshta|rundll32|regsvr32|certutil|bitsadmin|wmic|cscript|wscript|installutil)\b'){return @{Label='Suspicious';Reason='Living-off-the-land utility used; review the command.'}}
+  if($text -match '(?i)(?:-windowstyle\s+hidden|\bhidden\b|\bbypass\b|\bnop\b)'){return @{Label='Suspicious';Reason='Hidden window, execution-policy bypass, or no-profile behavior detected.'}}
+  if(Test-WindowsSystemProcess $Image){return @{Label='Legit';Reason='Windows system executable; routine activity unless its arguments look unusual.'}}
+  return @{Label='Legit';Reason='No high-risk command pattern matched.'}
+}
+function Show-Result { param([datetime]$Time,[string]$Source,[string]$Image,[string]$Command,[string]$Parent='')
+  $name=Get-ProgramName $Image $Command;$triage=Get-Triage $Command $Image;$commandShort=Shorten-Text $Command 140
+  $base='[{0}] [{1}] {2} | {3}' -f $Time.ToString('yyyy-MM-dd HH:mm:ss'),$Source,$name,$commandShort
+  if($Parent){$base+=' | Parent: '+(Get-ProgramName $Parent '')}
+  $line="$base | $($triage.Label) - $($triage.Reason)"
+  if($triage.Label -eq 'Suspicious'){C $line 'Red'}else{C $line 'Green'}
 }
 function Scan-PowerShell { param([datetime]$Since)
-  C "`n--- POWERSHELL TELEMETRY ---" 'Orange'
-  $events=@(); foreach($log in @('Microsoft-Windows-PowerShell/Operational','PowerShellCore/Operational')){$events+=Get-EventsSafe $log @(400,403,4103,4104,4105,4106) 2000 $Since}
-  $events=@($events|Sort-Object TimeCreated -Descending); C ("PowerShell events found: {0}" -f $events.Count) 'White'
-  if(!$events){C 'No PowerShell telemetry is available for the selected time range.' 'Orange';return}
-  foreach($event in ($events|Select-Object -First 150)){Show-Result $event.TimeCreated ("POWERSHELL-{0}" -f $event.Id) $event.Message}
+  C "`n--- POWERSHELL TELEMETRY ---" 'Orange';$events=@();foreach($log in @('Microsoft-Windows-PowerShell/Operational','PowerShellCore/Operational')){$events+=Get-EventsSafe $log @(400,403,4103,4104,4105,4106) 3000 $Since};$events=@($events|Sort-Object TimeCreated -Descending)
+  C ("PowerShell events found: {0}" -f $events.Count) 'White';if(!$events){C 'No PowerShell telemetry is available for the selected time range.' 'Orange';return}
+  foreach($event in ($events|Select-Object -First 150)){Show-Result $event.TimeCreated ("POWERSHELL-{0}" -f $event.Id) 'powershell.exe' $event.Message ''}
 }
 function Scan-SysmonProcessCreation { param([datetime]$Since)
-  C "`n--- SYSMON PROCESS CREATION ---" 'Orange'
-  $events=Get-EventsSafe 'Microsoft-Windows-Sysmon/Operational' @(1) 3000 $Since
-  if(!$events){C 'Sysmon Event ID 1 is unavailable for the selected time range.' 'Orange';return}
-  $count=0; $watch='(?i)\\(?:cmd|powershell|pwsh|mshta|rundll32|regsvr32|certutil|bitsadmin|wmic|cscript|wscript|installutil)\.exe$'
-  foreach($event in ($events|Sort-Object TimeCreated -Descending)){
-    $image=Get-EventDataValue $event 'Image';$parent=Get-EventDataValue $event 'ParentImage';$command=Get-EventDataValue $event 'CommandLine'
-    if(($image -match $watch) -or (Test-SuspiciousText $command)){$count++;Show-Result $event.TimeCreated 'SYSMON-1' $command ("image: {0}; parent: {1}" -f $image,$parent)}
-  }; C ("Sysmon matching records: {0}" -f $count) 'White'
+  C "`n--- SYSMON PROCESS CREATION ---" 'Orange';$events=Get-EventsSafe 'Microsoft-Windows-Sysmon/Operational' @(1) 4000 $Since;if(!$events){C 'Sysmon Event ID 1 is unavailable for the selected time range.' 'Orange';return}
+  $count=0;$watch='(?i)\\(?:cmd|powershell|pwsh|mshta|rundll32|regsvr32|certutil|bitsadmin|wmic|cscript|wscript|installutil)\.exe$'
+  foreach($event in ($events|Sort-Object TimeCreated -Descending)){$image=Get-EventDataValue $event 'Image';$parent=Get-EventDataValue $event 'ParentImage';$command=Get-EventDataValue $event 'CommandLine';if(($image -match $watch) -or ((Get-Triage $command $image).Label -eq 'Suspicious')){$count++;Show-Result $event.TimeCreated 'SYSMON-1' $image $command $parent}}
+  C ("Sysmon relevant records: {0}" -f $count) 'White'
 }
 function Scan-SecurityProcessCreation { param([datetime]$Since)
-  C "`n--- SECURITY PROCESS CREATION (4688) ---" 'Orange'
-  $events=Get-EventsSafe 'Security' @(4688) 3000 $Since
-  if(!$events){C 'No Security 4688 records available. Run as Administrator; auditing may be disabled.' 'Orange';return}
+  C "`n--- SECURITY PROCESS CREATION (4688) ---" 'Orange';$events=Get-EventsSafe 'Security' @(4688) 4000 $Since;if(!$events){C 'No Security 4688 records available. Run as Administrator; process-creation auditing may be disabled.' 'Orange';return}
   $count=0;$watch='(?i)\\(?:cmd|powershell|pwsh|mshta|rundll32|regsvr32|certutil|bitsadmin|wmic|cscript|wscript|installutil)\.exe$'
-  foreach($event in ($events|Sort-Object TimeCreated -Descending)){
-    $image=Get-EventDataValue $event 'NewProcessName';$parent=Get-EventDataValue $event 'ParentProcessName';$command=Get-EventDataValue $event 'CommandLine'
-    if(($image -match $watch) -or (Test-SuspiciousText $command)){$count++;if([string]::IsNullOrWhiteSpace($command)){$command=$image};Show-Result $event.TimeCreated 'SECURITY-4688' $command ("image: {0}; parent: {1}" -f $image,$parent)}
-  }; C ("Security 4688 matching records: {0}" -f $count) 'White'
+  foreach($event in ($events|Sort-Object TimeCreated -Descending)){$image=Get-EventDataValue $event 'NewProcessName';$parent=Get-EventDataValue $event 'ParentProcessName';$command=Get-EventDataValue $event 'CommandLine';if(($image -match $watch) -or ((Get-Triage $command $image).Label -eq 'Suspicious')){$count++;Show-Result $event.TimeCreated 'SECURITY-4688' $image $command $parent}}
+  C ("Security 4688 relevant records: {0}" -f $count) 'White'
 }
 function Scan-PrefetchEvidence { param([datetime]$Since)
-  C "`n--- PREFETCH EXECUTION EVIDENCE ---" 'Orange';$path=Join-Path $env:WINDIR 'Prefetch'
-  if(!(Test-Path -LiteralPath $path)){C 'Prefetch directory is unavailable.' 'Orange';return}
+  C "`n--- PREFETCH EXECUTION EVIDENCE ---" 'Orange';$path=Join-Path $env:WINDIR 'Prefetch';if(!(Test-Path -LiteralPath $path)){C 'Prefetch directory is unavailable.' 'Orange';return}
   $filters=@('CMD-*.pf','POWERSHELL-*.pf','PWSH-*.pf','MSHTA-*.pf','RUNDLL32-*.pf','REGSVR32-*.pf','CERTUTIL-*.pf','BITSADMIN-*.pf','WMIC-*.pf','CSCRIPT-*.pf','WSCRIPT-*.pf','INSTALLUTIL-*.pf')
-  $files=foreach($filter in $filters){Get-ChildItem -LiteralPath $path -Filter $filter -File};$files=@($files|Sort-Object LastWriteTime -Descending -Unique)
-  if($Since){$files=@($files|Where-Object{$_.LastWriteTime -ge $Since})}
+  $files=foreach($filter in $filters){Get-ChildItem -LiteralPath $path -Filter $filter -File};$files=@($files|Sort-Object LastWriteTime -Descending -Unique);if($Since){$files=@($files|Where-Object{$_.LastWriteTime -ge $Since})}
   if(!$files){C 'No monitored Prefetch records found for the selected time range.' 'Green';return}
-  foreach($file in ($files|Select-Object -First 100)){C ('[{0}] [PREFETCH] {1} | artifact only: executable likely ran; arguments unavailable' -f $file.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'),$file.Name) 'Yellow'}
+  foreach($file in ($files|Select-Object -First 100)){C ('[{0}] [PREFETCH] {1} | Info - Execution artifact only; exact command arguments are unavailable.' -f $file.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'),$file.Name) 'Yellow'}
 }
-function Scan-Cmd { param([datetime]$Since);C "`n=== CMD / PROCESS EXECUTION TRIAGE ===" 'Orange';Scan-SysmonProcessCreation $Since;Scan-SecurityProcessCreation $Since;Scan-PrefetchEvidence $Since }
+function Scan-Cmd { param([datetime]$Since);C "`n=== CMD / PROCESS EXECUTION TRIAGE ===" 'Orange';Scan-SysmonProcessCreation $Since;Scan-SecurityProcessCreation $Since;Scan-PrefetchEvidence $Since}
 function Scan-EventvwrDeletion { param([datetime]$Since)
   C "`n--- EVENT LOG CLEARING CHECK ---" 'Orange';$events=@();$events+=Get-EventsSafe 'Security' @(1102) 100 $Since;$events+=Get-EventsSafe 'System' @(104) 100 $Since
-  if($events.Count){C 'eventvwr logs were deleted' 'Red';foreach($event in ($events|Sort-Object TimeCreated -Descending)){C ('[{0}] [EVENT-CLEAR-{1}] {2}' -f $event.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'),$event.Id,(Shorten-Text $event.Message 180)) 'Red'}}else{C 'No recorded event-log clearing events found for the selected time range.' 'Green'}
+  if($events.Count){C 'eventvwr logs were deleted' 'Red';foreach($event in ($events|Sort-Object TimeCreated -Descending)){C ('[{0}] [EVENT-CLEAR-{1}] Event Log Service | {2} | Suspicious - Recorded event-log clearing activity.' -f $event.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'),$event.Id,(Shorten-Text $event.Message 150)) 'Red'}}else{C 'No recorded event-log clearing events found for the selected time range.' 'Green'}
 }
-function Scan-All { param([datetime]$Since);Scan-PowerShell $Since;Scan-Cmd $Since;Scan-EventvwrDeletion $Since }
+function Scan-All { param([datetime]$Since);Scan-PowerShell $Since;Scan-Cmd $Since;Scan-EventvwrDeletion $Since}
 while($true){
-  Header;C '[1] Scan for all filelesses';C '[2] Scan for PowerShell filelesses';C '[3] Scan for CMD filelesses';C '[4] Check for eventvwr deletion';C '[Q] Exit'
-  C "`nSelect option: " 'Orange' -NoNewline;$choice=Read-Host
-  if($choice.ToUpper() -eq 'Q'){break}
-  if($choice -notin @('1','2','3','4')){C 'Invalid option.' 'Red';Start-Sleep -Seconds 1;continue}
-  $since=Ask-InstanceOnly
+  Header;C '[1] Scan for all filelesses';C '[2] Scan for PowerShell filelesses';C '[3] Scan for CMD filelesses';C '[4] Check for eventvwr deletion';C '[Q] Exit';C "`nSelect option: " 'Orange' -NoNewline;$choice=Read-Host
+  if($choice.ToUpper() -eq 'Q'){break};if($choice -notin @('1','2','3','4')){C 'Invalid option.' 'Red';Start-Sleep 1;continue};$since=Ask-InstanceOnly
   switch($choice){'1'{Scan-All $since};'2'{Scan-PowerShell $since};'3'{Scan-Cmd $since};'4'{Scan-EventvwrDeletion $since}}
   C "`nClick a button to exit..." 'Orange';try{$null=$Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')}catch{Read-Host|Out-Null}
 }
